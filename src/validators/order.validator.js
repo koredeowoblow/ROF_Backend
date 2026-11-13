@@ -5,7 +5,14 @@ import { BaseValidator } from '../core/BaseValidator.js';
  */
 export class OrderValidator extends BaseValidator {
   static ALLOWED_SIZES = ['S', 'M', 'L', 'XL', 'XXL'];
-  static ALLOWED_PAYMENT_METHODS = ['paystack', 'bank_transfer', 'delivery'];
+  static ALLOWED_PAYMENT_METHODS = [
+    'paystack',
+    'stripe',
+    'flutterwave',
+    'flutter',
+    'bank_transfer',
+    'delivery',
+  ];
   static ALLOWED_STATUSES = [
     'received',
     'confirmed',

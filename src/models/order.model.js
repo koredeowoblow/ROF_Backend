@@ -93,8 +93,13 @@ const OrderSchema = new mongoose.Schema(
     payment: {
       method: {
         type: String,
-        enum: ['paystack', 'bank_transfer', 'delivery'],
+        enum: ['paystack', 'stripe', 'flutterwave', 'bank_transfer', 'delivery'],
         required: true,
+      },
+      provider: {
+        type: String,
+        enum: ['paystack', 'stripe', 'flutterwave', 'bank_transfer', 'delivery'],
+        default: 'paystack',
       },
       status: {
         type: String,

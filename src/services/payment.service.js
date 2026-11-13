@@ -1,88 +1,167 @@
 import { BaseService } from '../core/BaseService.js';
 import { AppError } from '../core/AppError.js';
+import { config } from '../config/index.js';
 import { cryptoService } from '../utils/crypto.js';
 import { PaymentInitializedResponseDTO } from '../dtos/payment.dto.js';
 import { OrderTrackingResponseDTO } from '../dtos/order.dto.js';
+import { PaymentGatewayStrategy } from './gateways/BaseGatewayService.js';
+import { PaystackGatewayStrategy, PaystackService } from './gateways/paystack.gateway.js';
+import { StripeGatewayStrategy, StripeService } from './gateways/stripe.gateway.js';
+import { FlutterwaveGatewayStrategy, FlutterwaveService } from './gateways/flutterwave.gateway.js';
+import {
+  BankTransferGatewayStrategy,
+  DeliveryGatewayStrategy,
+} from './gateways/offline.gateway.js';
 
-/**
- * Payment Gateway Strategy Classes (SOLID - OCP & LSP)
- */
-export class PaymentGatewayStrategy {
-  constructor(name) {
-    this.name = name;
-  }
-
-  async initialize(_params) {
-    throw new Error('initialize() must be implemented by PaymentGatewayStrategy subclass');
-  }
-
-  async verify(_reference) {
-    return { success: true, paidAt: new Date().toISOString() };
-  }
-}
-
-export class PaystackGatewayStrategy extends PaymentGatewayStrategy {
-  constructor() {
-    super('Paystack Nigeria');
-  }
-
-  async initialize({ orderId, amount }) {
-    const reference = `pstk_ref_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
-    return {
-      reference,
-      authorizationUrl: `https://checkout.paystack.com/${reference}`,
-      accessCode: `code_${Date.now()}`,
-      status: 'pending',
-      amount,
-      orderId,
-    };
-  }
-}
-
-export class BankTransferGatewayStrategy extends PaymentGatewayStrategy {
-  constructor() {
-    super('Direct Studio Bank Transfer');
-  }
-
-  async initialize({ orderId, amount }) {
-    return {
-      reference: `bank_ref_${Date.now()}`,
-      status: 'pending',
-      amount,
-      orderId,
-    };
-  }
-}
-
-export class DeliveryGatewayStrategy extends PaymentGatewayStrategy {
-  constructor() {
-    super('Pay on Delivery');
-  }
-
-  async initialize({ orderId, amount }) {
-    return {
-      reference: `cod_ref_${Date.now()}`,
-      status: 'pending',
-      amount,
-      orderId,
-    };
-  }
-}
+export {
+  PaymentGatewayStrategy,
+  PaystackGatewayStrategy,
+  PaystackService,
+  StripeGatewayStrategy,
+  StripeService,
+  FlutterwaveGatewayStrategy,
+  FlutterwaveService,
+  BankTransferGatewayStrategy,
+  DeliveryGatewayStrategy,
+};
 
 /**
  * Payment Orchestration Service (Class-Based, SOLID - SRP, OCP & DIP)
  *
- * Ensures users must be authenticated (or verified order owners) before payment
- * and links the authenticated user's `userId` to the order so every paid order
- * is accurately tracked under their account.
+ * Supports interchangeable online payment providers:
+ * - Paystack ('paystack')
+ * - Stripe ('stripe')
+ * - Flutterwave ('flutterwave' / 'flutter')
+ * Plus offline settlement channels:
+ * - Direct Studio Bank Transfer ('bank_transfer')
+ * - Pay on Delivery ('delivery')
+ *
+ * Switch the active online provider globally via `.env`:
+ *   PAYMENT_PROVIDER=paystack | stripe | flutterwave
+ * or at runtime via `paymentService.setDefaultProvider('stripe')`.
  */
 export class PaymentService extends BaseService {
   constructor(orderRepository, auditService) {
     super(orderRepository, auditService);
+
+    const paystackGateway = new PaystackGatewayStrategy();
+    const stripeGateway = new StripeGatewayStrategy();
+    const flutterwaveGateway = new FlutterwaveGatewayStrategy();
+    const bankTransferGateway = new BankTransferGatewayStrategy();
+    const deliveryGateway = new DeliveryGatewayStrategy();
+
     this.strategies = {
-      paystack: new PaystackGatewayStrategy(),
-      bank_transfer: new BankTransferGatewayStrategy(),
-      delivery: new DeliveryGatewayStrategy(),
+      paystack: paystackGateway,
+      stripe: stripeGateway,
+      flutterwave: flutterwaveGateway,
+      flutter: flutterwaveGateway,
+      bank_transfer: bankTransferGateway,
+      delivery: deliveryGateway,
+    };
+
+    this.activeProviderOverride = null;
+  }
+
+  /**
+   * Normalize provider alias ('flutter' -> 'flutterwave')
+   */
+  normalizeProviderName(name) {
+    const raw = String(name || '').trim().toLowerCase();
+    if (raw === 'flutter') return 'flutterwave';
+    return raw;
+  }
+
+  /**
+   * Return the currently active online payment provider ('paystack' | 'stripe' | 'flutterwave').
+   * Reads runtime override first, then process.env.PAYMENT_PROVIDER, then config.payment.defaultProvider.
+   */
+  getDefaultProvider() {
+    const candidate = this.normalizeProviderName(
+      this.activeProviderOverride ||
+        process.env.PAYMENT_PROVIDER ||
+        config.payment?.defaultProvider ||
+        'paystack'
+    );
+    if (['paystack', 'stripe', 'flutterwave'].includes(candidate)) {
+      return candidate;
+    }
+    return 'paystack';
+  }
+
+  /**
+   * Dynamically change the active online payment provider at runtime.
+   */
+  setDefaultProvider(providerName) {
+    const normalized = this.normalizeProviderName(providerName);
+    if (!['paystack', 'stripe', 'flutterwave'].includes(normalized)) {
+      throw AppError.badRequest(
+        `Invalid online payment provider '${providerName}'. Allowed: paystack, stripe, flutterwave`
+      );
+    }
+    this.activeProviderOverride = normalized;
+    return this.getDefaultProvider();
+  }
+
+  /**
+   * Resolve which gateway strategy to use for a given request.
+   * - Offline methods ('bank_transfer', 'delivery') always use their respective offline strategy.
+   * - Explicit provider override (`dto.provider`) routes directly to that provider.
+   * - Generic online methods ('card', 'online', 'default') or default 'paystack' when
+   *   PAYMENT_PROVIDER is configured to another provider route to `getDefaultProvider()`.
+   */
+  resolveProvider({ method, provider } = {}) {
+    if (provider) {
+      const explicit = this.normalizeProviderName(provider);
+      if (!this.strategies[explicit]) {
+        throw AppError.badRequest(`Unsupported payment provider: ${provider}`);
+      }
+      return explicit;
+    }
+
+    const normalizedMethod = this.normalizeProviderName(method);
+    if (normalizedMethod === 'bank_transfer' || normalizedMethod === 'delivery') {
+      return normalizedMethod;
+    }
+
+    if (normalizedMethod === 'stripe' || normalizedMethod === 'flutterwave') {
+      return normalizedMethod;
+    }
+
+    if (
+      !normalizedMethod ||
+      normalizedMethod === 'card' ||
+      normalizedMethod === 'online' ||
+      normalizedMethod === 'default'
+    ) {
+      return this.getDefaultProvider();
+    }
+
+    if (normalizedMethod === 'paystack') {
+      return this.getDefaultProvider();
+    }
+
+    if (!this.strategies[normalizedMethod]) {
+      throw AppError.badRequest(`Unsupported payment gateway strategy: ${method}`);
+    }
+
+    return normalizedMethod;
+  }
+
+  /**
+   * List available payment providers and the currently active default online provider.
+   */
+  getProvidersConfig() {
+    const defaultProvider = this.getDefaultProvider();
+    return {
+      defaultProvider,
+      activeGateway: this.strategies[defaultProvider]?.getPublicConfig(),
+      providers: {
+        paystack: this.strategies.paystack.getPublicConfig(),
+        stripe: this.strategies.stripe.getPublicConfig(),
+        flutterwave: this.strategies.flutterwave.getPublicConfig(),
+        bank_transfer: this.strategies.bank_transfer.getPublicConfig(),
+        delivery: this.strategies.delivery.getPublicConfig(),
+      },
     };
   }
 
@@ -116,10 +195,14 @@ export class PaymentService extends BaseService {
       );
     }
 
-    const method = initPaymentDto.method || order.payment?.method || 'paystack';
-    const strategy = this.strategies[method];
+    const resolvedProvider = this.resolveProvider({
+      method: initPaymentDto.method || order.payment?.method,
+      provider: initPaymentDto.provider,
+    });
+
+    const strategy = this.strategies[resolvedProvider];
     if (!strategy) {
-      throw AppError.badRequest(`Unsupported payment gateway strategy: ${method}`);
+      throw AppError.badRequest(`Unsupported payment gateway strategy: ${resolvedProvider}`);
     }
 
     const initialized = await strategy.initialize({
@@ -127,24 +210,31 @@ export class PaymentService extends BaseService {
       amount: order.total, // Server-authoritative total
       email: order.customer.email,
       phone: order.customer.phone,
+      customerName: order.customer.name,
       callbackUrl: initPaymentDto.callbackUrl,
+      currency: initPaymentDto.currency,
     });
 
     // Bind authenticatedUser.id to the order so it is permanently linked for tracking
     await this.repository.updateById(order.id, {
       userId: order.userId || authenticatedUser.id,
       payment: {
-        method,
+        method: resolvedProvider,
+        provider: resolvedProvider,
         status: order.payment.status,
         reference: initialized.reference,
       },
     });
 
-    return PaymentInitializedResponseDTO.fromEntity(initialized);
+    return PaymentInitializedResponseDTO.fromEntity({
+      ...initialized,
+      provider: resolvedProvider,
+      method: resolvedProvider,
+    });
   }
 
   /**
-   * Verify payment by reference and transition order to 'confirmed' for real-time tracking
+   * Verify payment by reference across the order's active gateway and transition order to 'confirmed'
    */
   async verifyPayment(reference, authenticatedUser = null) {
     const order = await this.repository.findByPaymentReference(reference);
@@ -162,11 +252,22 @@ export class PaymentService extends BaseService {
       throw AppError.idor('IDOR Protection: You are not authorized to verify this payment');
     }
 
-    const paidAt = new Date().toISOString();
+    const providerKey = this.normalizeProviderName(
+      order.payment?.provider || order.payment?.method || this.getDefaultProvider()
+    );
+    const strategy = this.strategies[providerKey] || this.strategies[this.getDefaultProvider()];
+    const verificationResult = await strategy.verify(reference);
+
+    if (!verificationResult.verified && !verificationResult.success) {
+      throw AppError.badRequest(`Payment verification failed for reference ${reference}`);
+    }
+
+    const paidAt = verificationResult.paidAt || new Date().toISOString();
     await this.repository.updateById(order.id, {
       userId: order.userId || authenticatedUser?.id || null,
       payment: {
         ...order.payment,
+        provider: providerKey,
         status: 'paid',
         paidAt,
       },
@@ -174,7 +275,7 @@ export class PaymentService extends BaseService {
 
     const updatedOrder = await this.repository.transitionStatus(order.id, {
       status: order.status === 'received' ? 'confirmed' : order.status,
-      note: `Payment verified (${reference})`,
+      note: `Payment verified via ${strategy.name} (${reference})`,
     });
 
     await this.recordAudit({
@@ -182,7 +283,7 @@ export class PaymentService extends BaseService {
       entity: 'Order',
       entityId: order.id,
       user: authenticatedUser?.email || order.customer.email,
-      details: `Payment reference ${reference} verified and order confirmed`,
+      details: `${strategy.name} reference ${reference} verified and order confirmed`,
     });
 
     const accessToken = cryptoService.generateOrderAccessToken(
@@ -195,41 +296,63 @@ export class PaymentService extends BaseService {
   }
 
   /**
-   * Handle Paystack webhook events (charge.success)
+   * Unified Webhook Handler for Paystack, Stripe, and Flutterwave
    */
-  async handlePaystackWebhook(eventPayload = {}, signatureHeader = null) {
+  async handleWebhook(providerName, eventPayload = {}, signatureHeader = null) {
+    const normalized = this.normalizeProviderName(providerName || this.getDefaultProvider());
+    const strategy = this.strategies[normalized];
+    if (!strategy) {
+      throw AppError.badRequest(`Unsupported webhook payment provider: ${providerName}`);
+    }
+
     if (signatureHeader) {
-      const isValidSig = cryptoService.verifyPaystackSignature(eventPayload, signatureHeader);
+      const isValidSig = strategy.verifyWebhookSignature(eventPayload, signatureHeader);
       if (!isValidSig) {
-        throw AppError.unauthorized('Invalid Paystack webhook signature', 'INVALID_SIGNATURE');
+        throw AppError.unauthorized(
+          `Invalid ${strategy.name} webhook signature`,
+          'INVALID_SIGNATURE'
+        );
       }
     }
 
-    if (eventPayload?.event === 'charge.success' && eventPayload?.data?.reference) {
-      const reference = String(eventPayload.data.reference);
-      const order = await this.repository.findByPaymentReference(reference);
+    const parsed = strategy.parseWebhookEvent(eventPayload);
+    if (parsed.isPaid && parsed.reference) {
+      const order = await this.repository.findByPaymentReference(parsed.reference);
       if (order) {
         await this.repository.updateById(order.id, {
           payment: {
             ...order.payment,
+            provider: normalized,
             status: 'paid',
             paidAt: new Date().toISOString(),
           },
         });
         await this.repository.transitionStatus(order.id, {
           status: 'confirmed',
-          note: `Paystack webhook verified charge.success (${reference})`,
+          note: `${strategy.name} webhook verified ${parsed.event} (${parsed.reference})`,
         });
         await this.recordAudit({
           action: 'Payment Webhook Confirmed',
           entity: 'Order',
           entityId: order.id,
-          user: 'Paystack Webhook',
-          details: `Verified payment reference ${reference}`,
+          user: `${strategy.name} Webhook`,
+          details: `Verified payment reference ${parsed.reference}`,
         });
       }
     }
 
-    return { status: 'success', received: true };
+    return { status: 'success', provider: normalized, received: true };
+  }
+
+  async handlePaystackWebhook(eventPayload = {}, signatureHeader = null) {
+    return this.handleWebhook('paystack', eventPayload, signatureHeader);
+  }
+
+  async handleStripeWebhook(eventPayload = {}, signatureHeader = null) {
+    return this.handleWebhook('stripe', eventPayload, signatureHeader);
+  }
+
+  async handleFlutterwaveWebhook(eventPayload = {}, signatureHeader = null) {
+    return this.handleWebhook('flutterwave', eventPayload, signatureHeader);
   }
 }

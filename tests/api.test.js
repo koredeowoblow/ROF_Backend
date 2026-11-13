@@ -6,6 +6,8 @@ import { BaseDTO } from '../src/core/BaseDTO.js';
 import { Paginator } from '../src/utils/pagination.js';
 import { RequestSanitizer } from '../src/middlewares/requestSanitizer.js';
 import { IdorProtection } from '../src/middlewares/idorProtection.js';
+import { RateLimiter } from '../src/middlewares/rateLimiter.js';
+import { SecurityShield } from '../src/middlewares/securityMiddleware.js';
 import { TryCatchHandler } from '../src/middlewares/tryCatchHandler.js';
 import { ResponseHandler } from '../src/utils/responseHandler.js';
 import { ProductValidator } from '../src/validators/product.validator.js';
@@ -877,5 +879,168 @@ describe('ROF RAGE Backend Architecture Suite (SOLID, DRY, Sanitizer, IDOR, Pagi
     assert.equal(jsonPayload.success, true);
     assert.equal(headersSet['X-Total-Count'], '1');
     assert.equal(jsonPayload.pagination.totalItems, 1);
+  });
+
+  it('RateLimiter enforces sliding/fixed window request limits and emits RFC rate-limit headers', () => {
+    const limiter = RateLimiter.create({
+      windowMs: 60000,
+      max: 2,
+      keyPrefix: 'test-auth',
+    });
+
+    const headers = {};
+    const mockRes = {
+      setHeader(k, v) {
+        headers[k] = v;
+      },
+    };
+    const mockReq = {
+      ip: '203.0.113.42',
+      headers: {},
+    };
+
+    let count = 0;
+    limiter(mockReq, mockRes, () => {
+      count += 1;
+    });
+    assert.equal(count, 1);
+    assert.equal(headers['X-RateLimit-Limit'], '2');
+    assert.equal(headers['X-RateLimit-Remaining'], '1');
+
+    limiter(mockReq, mockRes, () => {
+      count += 1;
+    });
+    assert.equal(count, 2);
+    assert.equal(headers['X-RateLimit-Remaining'], '0');
+
+    // 3rd request within window must throw 429 TOO_MANY_REQUESTS and set Retry-After
+    assert.throws(
+      () => limiter(mockReq, mockRes, () => {}),
+      (err) => Boolean(err.statusCode === 429 && err.code === 'TOO_MANY_REQUESTS')
+    );
+    assert.ok(Number(headers['Retry-After']) > 0);
+  });
+
+  it('SecurityShield validates CORS origins, blocks HTTP parameter pollution, and rejects unsafe methods/URLs', () => {
+    const allowedList = ['http://localhost:5143', 'https://*.rofrage.com'];
+    assert.equal(SecurityShield.isOriginAllowed('http://localhost:5143', allowedList), true);
+    assert.equal(SecurityShield.isOriginAllowed('https://store.rofrage.com', allowedList), true);
+    assert.equal(SecurityShield.isOriginAllowed('https://evil.example.com', allowedList), false);
+
+    // HPP guard collapses duplicate scalar query params
+    const hpp = SecurityShield.preventParameterPollution();
+    const req = {
+      query: {
+        sort: ['price-low', 'price-high'],
+        tags: ['featured', 'new'],
+      },
+    };
+    hpp(req, {}, () => {});
+    assert.equal(req.query.sort, 'price-high');
+    assert.deepEqual(req.query.tags, ['featured', 'new']);
+
+    // Method & URL guard blocks TRACE and encoded traversal
+    const guard = SecurityShield.methodAndUrlGuard();
+    assert.throws(
+      () => guard({ method: 'TRACE', originalUrl: '/api/v1/products', headers: {} }, {}, () => {}),
+      (err) => Boolean(err.statusCode === 405 && err.code === 'METHOD_NOT_ALLOWED')
+    );
+    assert.throws(
+      () =>
+        guard(
+          { method: 'GET', originalUrl: '/api/v1/products/%2e%2e/secret', headers: {} },
+          {},
+          () => {}
+        ),
+      (err) => Boolean(err.statusCode === 400 && err.code === 'MALFORMED_URL')
+    );
+  });
+
+  it('PaymentService supports Paystack, Stripe, and Flutterwave and switches active provider dynamically', async () => {
+    const orderStore = {
+      'ROF-700101': {
+        id: 'ROF-700101',
+        userId: null,
+        total: 45000,
+        status: 'received',
+        customer: {
+          name: 'Adaeze Obi',
+          email: 'adaeze@rofrage.com',
+          phone: '+2348091112233',
+          address: '10 Bourdillon Road, Ikoyi',
+          city: 'Lagos',
+          state: 'Lagos',
+        },
+        payment: { method: 'paystack', status: 'pending', reference: '' },
+        history: [{ status: 'received', timestamp: new Date().toISOString(), note: 'Order created' }],
+      },
+    };
+
+    const mockOrderRepo = {
+      async findById(id) {
+        return orderStore[id] || null;
+      },
+      async findByPaymentReference(ref) {
+        return Object.values(orderStore).find((o) => o.payment?.reference === ref) || null;
+      },
+      async updateById(id, patch) {
+        orderStore[id] = { ...orderStore[id], ...patch };
+        return orderStore[id];
+      },
+      async transitionStatus(id, { status, note }) {
+        const ord = orderStore[id];
+        ord.status = status;
+        ord.history.push({ status, timestamp: new Date().toISOString(), note });
+        return ord;
+      },
+    };
+
+    const paymentService = new PaymentService(mockOrderRepo, { async logAction() {} });
+    const customerUser = { id: 'user-ada', email: 'adaeze@rofrage.com', role: 'Customer' };
+
+    // 1. Default provider starts as Paystack
+    assert.equal(paymentService.getDefaultProvider(), 'paystack');
+    const paystackInit = await paymentService.initializePayment(
+      { orderId: 'ROF-700101', method: 'paystack' },
+      customerUser
+    );
+    assert.equal(paystackInit.provider, 'paystack');
+    assert.ok(paystackInit.reference.startsWith('pstk_ref_'));
+    assert.ok(paystackInit.authorizationUrl.includes('checkout.paystack.com'));
+
+    // 2. Switch default backend provider to Stripe -> generic / default calls now use Stripe!
+    paymentService.setDefaultProvider('stripe');
+    assert.equal(paymentService.getDefaultProvider(), 'stripe');
+    const stripeInit = await paymentService.initializePayment(
+      { orderId: 'ROF-700101', method: 'paystack' },
+      customerUser
+    );
+    assert.equal(stripeInit.provider, 'stripe');
+    assert.ok(stripeInit.reference.startsWith('cs_test_'));
+    assert.ok(stripeInit.authorizationUrl.includes('checkout.stripe.com'));
+
+    // 3. Switch default backend provider to Flutterwave ('flutter' alias also works)
+    paymentService.setDefaultProvider('flutter');
+    assert.equal(paymentService.getDefaultProvider(), 'flutterwave');
+    const flwInit = await paymentService.initializePayment(
+      { orderId: 'ROF-700101', method: 'paystack' },
+      customerUser
+    );
+    assert.equal(flwInit.provider, 'flutterwave');
+    assert.ok(flwInit.reference.startsWith('flw_ref_'));
+    assert.ok(flwInit.authorizationUrl.includes('checkout.flutterwave.com'));
+
+    // 4. Verify Flutterwave webhook with valid verif-hash transitions order to confirmed + paid
+    const webhookRes = await paymentService.handleFlutterwaveWebhook(
+      {
+        event: 'charge.completed',
+        data: { tx_ref: flwInit.reference, status: 'successful' },
+      },
+      'rof_rage_flutterwave_webhook_hash_2026'
+    );
+    assert.equal(webhookRes.status, 'success');
+    assert.equal(webhookRes.provider, 'flutterwave');
+    assert.equal(orderStore['ROF-700101'].payment.status, 'paid');
+    assert.equal(orderStore['ROF-700101'].status, 'confirmed');
   });
 });

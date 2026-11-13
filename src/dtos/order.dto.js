@@ -55,7 +55,12 @@ export class CreateOrderRequestDTO extends BaseDTO {
       notes: rawCustomer.notes,
     });
     this.items = OrderItemDTO.fromEntities(body.items || []);
-    this.paymentMethod = body.paymentMethod || 'paystack';
+    const rawMethod = String(
+      body.paymentMethod || body.payment?.method || 'paystack'
+    )
+      .trim()
+      .toLowerCase();
+    this.paymentMethod = rawMethod === 'flutter' ? 'flutterwave' : rawMethod;
     this.discountCode = body.discountCode
       ? String(body.discountCode).trim().toUpperCase()
       : undefined;

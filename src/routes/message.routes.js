@@ -1,16 +1,19 @@
 import { Router } from 'express';
 import { routeTryCatch } from '../middlewares/tryCatchHandler.js';
 import { AuthMiddleware } from '../middlewares/authMiddleware.js';
+import { RateLimiter } from '../middlewares/rateLimiter.js';
 import { ValidatorMiddleware } from '../middlewares/validatorMiddleware.js';
 import { MessageValidator } from '../validators/message.validator.js';
 import { PaginationValidator } from '../validators/pagination.validator.js';
 
 export function createMessageRoutes(messageController) {
   const router = Router();
+  const writeRateLimit = RateLimiter.publicWrite();
 
   // Public or authenticated customer: submit a contact/order inquiry message
   router.post(
     '/',
+    routeTryCatch(writeRateLimit),
     routeTryCatch(AuthMiddleware.optionalAuth),
     routeTryCatch(ValidatorMiddleware.body(MessageValidator.validateCreateMessage)),
     routeTryCatch(messageController.sendContactMessage)
@@ -70,9 +73,11 @@ export function createMessageRoutes(messageController) {
 
 export function createNewsletterRoutes(newsletterController) {
   const router = Router();
+  const writeRateLimit = RateLimiter.publicWrite();
 
   router.post(
     '/',
+    routeTryCatch(writeRateLimit),
     routeTryCatch(ValidatorMiddleware.body(MessageValidator.validateNewsletter)),
     routeTryCatch(newsletterController.subscribe)
   );
